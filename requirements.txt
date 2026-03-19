@@ -25,3 +25,8 @@ tqdm==4.67.3
 typing-inspection==0.4.2
 typing_extensions==4.15.0
 urllib3==2.6.3
+
+dotenv~=0.9.9
+python-dotenv~=1.2.2
+typer~=0.24.1
+json_repair~=0.58.6
