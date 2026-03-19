@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from loguru import logger
 
 from skills_executor.agent.agent import Agent
 from skills_executor.agent.context import ContextBuilder
+from skills_executor.agent.security import SecurityValidator
 from skills_executor.providers.base import LLMProvider
 from skills_executor.skills.SkillsLoader import SkillsLoader
 from skills_executor.tools.registry import ToolRegistry
@@ -179,6 +181,9 @@ class MultiAgent:
         model: str = "glm-5",
         max_iterations: int = 30,
         enable_subagent: bool = True,
+        max_concurrent_subagents: int = 3,
+        enable_skill_cache: bool = True,
+        cache_ttl: int = 300,
     ) -> None:
         self.provider = provider
         self.tools = tool_registry
@@ -194,6 +199,18 @@ class MultiAgent:
         # Main agent history
         self._history: list[dict[str, Any]] = []
 
+        # Skill identification cache
+        self._skill_cache: dict[str, tuple[str | None, float]] = {}
+        self._cache_ttl = cache_ttl
+        self._enable_cache = enable_skill_cache
+
+        # Concurrency control
+        self._subagent_semaphore = asyncio.Semaphore(max_concurrent_subagents)
+
+        # Token usage tracking
+        self._total_tokens_used = 0
+        self._tokens_saved = 0
+
     async def run(self, user_message: str) -> tuple[str, list[str]]:
         """
         Process a user message.
@@ -205,14 +222,17 @@ class MultiAgent:
         Returns:
             (final_text, tools_used_list)
         """
-        # Step 1: Check if user query matches a skill
-        skill_match = await self._identify_skill(user_message)
+        # Sanitize user input
+        sanitized_message = SecurityValidator.sanitize_user_input(user_message)
+
+        # Step 1: Check if user query matches a skill (with caching)
+        skill_match = await self._identify_skill_cached(sanitized_message)
 
         if skill_match and self.enable_subagent:
-            # Step 2: Delegate to SubAgent
+            # Step 2: Delegate to SubAgent (with concurrency control)
             logger.info(f"Delegating to SubAgent for skill: {skill_match}")
-            # 多skill 是不是可以并行处理
-            result = await self._execute_skill_via_subagent(skill_match, user_message)
+            async with self._subagent_semaphore:
+                result = await self._execute_skill_via_subagent(skill_match, sanitized_message)
 
             if result.success:
                 # Record the result in main agent history (compressed)
@@ -224,7 +244,38 @@ class MultiAgent:
                 return await self._run_main_agent(user_message)
 
         # Step 3: No skill match, use main agent
-        return await self._run_main_agent(user_message)
+        return await self._run_main_agent(sanitized_message)
+
+    async def _identify_skill_cached(self, user_message: str) -> str | None:
+        """
+        Identify skill with caching support.
+
+        Args:
+            user_message: User query
+
+        Returns:
+            Skill name or None
+        """
+        if not self._enable_cache:
+            return await self._identify_skill(user_message)
+
+        # Generate cache key (hash of first 100 chars)
+        cache_key = str(hash(user_message.lower()[:100]))
+
+        # Check cache
+        if cache_key in self._skill_cache:
+            skill, timestamp = self._skill_cache[cache_key]
+            if time.time() - timestamp < self._cache_ttl:
+                logger.debug(f"Skill cache hit: {skill}")
+                return skill
+
+        # Cache miss, identify skill
+        skill = await self._identify_skill(user_message)
+
+        # Update cache
+        self._skill_cache[cache_key] = (skill, time.time())
+
+        return skill
 
     async def _identify_skill(self, user_message: str) -> str | None:
         """
@@ -339,13 +390,22 @@ If no skill matches, respond with "NONE".
         This keeps the main agent aware of what happened without including
         the full skill content and tool call details.
         """
+        # Redact sensitive information
+        sanitized_content = SecurityValidator.redact_sensitive_info(result.content)
+
         compressed_result = (
             f"[Skill: {result.skill_name}] "
-            f"{result.content[:200]}..."  # Only keep first 200 chars
+            f"{sanitized_content[:200]}..."  # Only keep first 200 chars
         )
 
         self._history.append({"role": "user", "content": user_query})
         self._history.append({"role": "assistant", "content": compressed_result})
+
+        # Update token stats
+        if result.token_usage:
+            self._total_tokens_used += result.token_usage.get("total_tokens", 0)
+            # Estimate tokens saved (rough calculation)
+            self._tokens_saved += len(result.content) - 200  # Compressed vs full
 
     def reset_history(self) -> None:
         """Clear conversation history."""
@@ -357,7 +417,34 @@ If no skill matches, respond with "NONE".
             "history_length": len(self._history),
             "available_skills": len(self.skills.list_skills()),
             "subagent_enabled": self.enable_subagent,
+            "cache_enabled": self._enable_cache,
+            "cache_size": len(self._skill_cache),
+            "total_tokens_used": self._total_tokens_used,
+            "tokens_saved": self._tokens_saved,
         }
+
+    def get_token_stats(self) -> dict[str, Any]:
+        """
+        Get detailed token usage statistics.
+
+        Returns:
+            Token usage stats including savings rate
+        """
+        total_tokens = self._total_tokens_used
+        tokens_saved = self._tokens_saved
+        savings_rate = tokens_saved / total_tokens if total_tokens > 0 else 0.0
+
+        return {
+            "total_tokens_used": total_tokens,
+            "tokens_saved": tokens_saved,
+            "savings_rate": savings_rate,
+            "estimated_cost_saved": tokens_saved * 0.00001,  # Rough estimate
+        }
+
+    def clear_cache(self) -> None:
+        """Clear the skill identification cache."""
+        self._skill_cache.clear()
+        logger.info("Skill cache cleared")
 
 
 # ── Factory helper ────────────────────────────────────────────────────────────
@@ -370,6 +457,9 @@ def build_multi_agent(
     model: str = "glm-5",
     max_iterations: int = 30,
     enable_subagent: bool = True,
+    max_concurrent_subagents: int = 3,
+    enable_skill_cache: bool = True,
+    cache_ttl: int = 300,
 ) -> MultiAgent:
     """
     Build a MultiAgent instance.
@@ -382,6 +472,9 @@ def build_multi_agent(
         model: Model name
         max_iterations: Max iterations for main agent
         enable_subagent: Enable SubAgent delegation (set False to use main agent only)
+        max_concurrent_subagents: Max concurrent SubAgent executions
+        enable_skill_cache: Enable skill identification caching
+        cache_ttl: Cache time-to-live in seconds
 
     Returns:
         MultiAgent instance
@@ -394,4 +487,7 @@ def build_multi_agent(
         model=model,
         max_iterations=max_iterations,
         enable_subagent=enable_subagent,
+        max_concurrent_subagents=max_concurrent_subagents,
+        enable_skill_cache=enable_skill_cache,
+        cache_ttl=cache_ttl,
     )
