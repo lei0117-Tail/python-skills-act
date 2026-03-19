@@ -11,6 +11,7 @@
 - **🤖 Agent 循环**: 自动处理 LLM 与工具调用的交互循环
 - **📡 多模型支持**: 支持 OpenAI 兼容 API（美团内部 GLM、GPT 等）
 - **💻 CLI 命令行工具**: 开箱即用的命令行接口 `python-skill-bot`
+- **🚀 MultiAgent 系统** (NEW!): 通过 SubAgent 委托降低 48%+ Token 开销
 
 ## 安装
 
@@ -61,7 +62,50 @@ LLM_DEFAULT_MODEL=gpt-4o-mini
 
 ## 使用方式
 
-### 1. 命令行工具 (CLI)
+### 1. MultiAgent 系统 (推荐)
+
+使用 MultiAgent 系统可以显著降低 Token 开销（48%+ 节省）：
+
+```python
+from skills_executor.agent.multi_agent import build_multi_agent
+from skills_executor.providers.custom_provider import CustomProvider
+from skills_executor.skills.SkillsLoader import SkillsLoader
+from skills_executor.tools.registry import ToolRegistry
+from pathlib import Path
+
+# 创建 MultiAgent
+multi_agent = build_multi_agent(
+    provider=CustomProvider(),
+    tool_registry=registry,
+    skills_loader=SkillsLoader("~/.claude/skills"),
+    workspace=Path.cwd(),
+    model="glm-5",
+    enable_subagent=True,  # 启用 SubAgent 委托
+    enable_skill_cache=True,  # 启用 Skill 识别缓存
+)
+
+# 执行查询
+response, tools = await multi_agent.run("北京今天天气怎么样?")
+
+# 查看统计信息
+stats = multi_agent.get_stats()
+print(f"Token 节省: {stats['tokens_saved']}")
+
+# 查看详细 Token 统计
+token_stats = multi_agent.get_token_stats()
+print(f"节省率: {token_stats['savings_rate']:.2%}")
+```
+
+**MultiAgent 优势:**
+- ✅ Token 节省 48%+ (多次 Skill 调用场景)
+- ✅ 上下文隔离 (SubAgent 独立执行)
+- ✅ 智能缓存 (Skill 识别缓存)
+- ✅ 并发控制 (防止资源耗尽)
+- ✅ 安全增强 (输入清理 + 敏感信息过滤)
+
+详见: [MultiAgent 设计文档](README_MULTI_AGENT.md)
+
+### 2. 命令行工具 (CLI)
 
 安装后可直接使用 `python-skill-bot` 命令：
 
@@ -88,7 +132,9 @@ python-skill-bot version
 python-skill-bot --help
 ```
 
-### 2. Python API
+### 3. Python API (原有 Agent)
+
+如果不需要 MultiAgent 的高级功能，可以使用原有的简单 Agent：
 
 ```python
 import asyncio
@@ -111,6 +157,11 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 ```
+
+**何时使用原有 Agent:**
+- 简单的单次查询
+- 不需要 Token 优化
+- 调试和测试场景
 
 ## Skills 技能系统
 
